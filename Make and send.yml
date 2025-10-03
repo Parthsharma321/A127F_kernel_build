@@ -1,0 +1,92 @@
+name: Build A127F kernel and send to Telegram
+
+on:
+  workflow_dispatch:     # manual trigger from Actions UI
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      KERNEL_TARBALL_URL: ${{ secrets.KERNEL_TARBALL_URL }}
+
+    steps:
+      - name: Checkout repo (if kernel source is committed)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download kernel tarball (optional)
+        if: env.KERNEL_TARBALL_URL != ''
+        run: |
+          echo "Downloading kernel tarball..."
+          wget -qO kernel.tar.xz "${KERNEL_TARBALL_URL}"
+          mkdir -p kernel_src
+          # try auto detection of compression type
+          if file kernel.tar.xz | grep -q 'XZ'; then
+            tar -xJf kernel.tar.xz -C kernel_src --strip-components=1
+          elif file kernel.tar.xz | grep -q 'gzip'; then
+            tar -xzf kernel.tar.xz -C kernel_src --strip-components=1
+          else
+            tar -xvf kernel.tar.xz -C kernel_src --strip-components=1
+          fi
+          ls -la kernel_src
+
+      - name: Prepare kernel root
+        run: |
+          # if we downloaded into kernel_src, move contents to workspace root
+          if [ -d kernel_src ] && [ "$(ls -A kernel_src)" ]; then
+            echo "Using kernel from kernel_src"
+            mv kernel_src/* .
+            rm -rf kernel_src
+          else
+            echo "Using kernel source from repo root"
+          fi
+          echo "Kernel root listing:"
+          ls -la | sed -n '1,160p'
+
+      - name: Get defconfig candidates
+        run: |
+          echo "Available defconfigs (arch/arm64/configs):"
+          ls -la arch/arm64/configs || true
+
+      - name: Kernel build (android-kernel-actions)
+        id: build
+        uses: lemniskett/android-kernel-actions@master
+        with:
+          arch: arm64
+          compiler: proton-clang/master
+          # Replace the defconfig below with the exact defconfig name found in the previous step
+          defconfig: exynos850-a12snsxx_defconfig
+          image: Image.gz-dtb
+        env:
+          NAME: A127F-Build
+
+      - name: Show build outputs
+        if: steps.build.outputs.outfile != ''
+        run: |
+          echo "Outfile: ${{ steps.build.outputs.outfile }}"
+          ls -lh ${{ steps.build.outputs.outfile }} || true
+
+      - name: Upload artifact to GitHub (backup)
+        if: steps.build.outputs.outfile != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifact
+          path: ${{ steps.build.outputs.outfile }}
+
+      - name: Send build artifact to Telegram
+        if: steps.build.outputs.outfile != ''
+        run: |
+          FILE="${{ steps.build.outputs.outfile }}"
+          echo "Sending $FILE to Telegram..."
+          # sendDocument API call - may timeout for very large files
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TELEGRAM_CHAT_ID}" \
+            -F document=@"${FILE}" \
+            -F caption="Kernel build artifact from GitHub Actions: $GITHUB_RUN_ID" \
+            --max-time 300
